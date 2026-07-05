@@ -1,0 +1,241 @@
+name: 'Go Guardian — All-in-One Go Quality Gate'
+description: 'Run gofmt, go vet, golangci-lint, and go test in a single step. Configurable severity. Annotates PRs.'
+author: 'kryptorious'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  go-version:
+    description: 'Go version to use (e.g. "1.22"). Defaults to latest stable via go.mod.'
+    required: false
+    default: ''
+  working-directory:
+    description: 'Directory containing go.mod. Defaults to repository root.'
+    required: false
+    default: '.'
+  skip-lint:
+    description: 'Skip golangci-lint check.'
+    required: false
+    default: 'false'
+  skip-vet:
+    description: 'Skip go vet check.'
+    required: false
+    default: 'false'
+  skip-fmt:
+    description: 'Skip gofmt check.'
+    required: false
+    default: 'false'
+  skip-test:
+    description: 'Skip go test run.'
+    required: false
+    default: 'false'
+  lint-args:
+    description: 'Extra arguments passed to golangci-lint run.'
+    required: false
+    default: ''
+  test-args:
+    description: 'Extra arguments passed to go test.'
+    required: false
+    default: '-v -race -count=1 ./...'
+  severity:
+    description: 'On failure: "error" exits non-zero, "warning" annotates but passes.'
+    required: false
+    default: 'error'
+  annotate:
+    description: 'Create GitHub annotations per finding (requires token).'
+    required: false
+    default: 'true'
+
+outputs:
+  go-version:
+    description: 'The Go version used during the run.'
+    value: ${{ steps.setup.outputs.go-version }}
+  lint-report:
+    description: 'Path to the golangci-lint report file (if lint ran).'
+    value: ${{ steps.lint.outputs.report }}
+  test-report:
+    description: 'Path to the go test JSON output file (if test ran).'
+    value: ${{ steps.test.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Go
+      id: setup
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.go-version }}" ]; then
+          GO_VERSION="${{ inputs.go-version }}"
+        else
+          # Derive from go.mod if available, otherwise fall back
+          GO_VERSION=$(grep -oP '^go \K[0-9.]+' "${{ inputs.working-directory }}/go.mod" 2>/dev/null || echo "")
+          if [ -z "$GO_VERSION" ]; then
+            GO_VERSION="1.22"
+          fi
+        fi
+        echo "Using Go version: $GO_VERSION"
+        echo "go-version=$GO_VERSION" >> "$GITHUB_OUTPUT"
+
+        echo "$GO_VERSION" > /tmp/.go-guardian-version
+
+    - name: gofmt
+      if: ${{ inputs.skip-fmt != 'true' }}
+      shell: bash
+      run: |
+        echo "::group::gofmt check"
+        working_dir="${{ inputs.working-directory }}"
+        UNFORMATTED=$(gofmt -l "$working_dir" 2>&1 || true)
+
+        if [ -n "$UNFORMATTED" ]; then
+          msg="gofmt: the following files are not formatted correctly:"
+          echo "$msg"
+          echo "$UNFORMATTED"
+
+          if [ "${{ inputs.annotate }}" = "true" ]; then
+            while IFS= read -r file; do
+              [ -z "$file" ] && continue
+              echo "::error file=$file,title=gofmt::File is not gofmt'd"
+            done <<< "$UNFORMATTED"
+          fi
+
+          if [ "${{ inputs.severity }}" = "error" ]; then
+            echo "::endgroup::"
+            exit 1
+          fi
+        else
+          echo "All .go files are properly formatted."
+        fi
+        echo "::endgroup::"
+
+    - name: go vet
+      if: ${{ inputs.skip-vet != 'true' }}
+      shell: bash
+      run: |
+        echo "::group::go vet"
+        working_dir="${{ inputs.working-directory }}"
+        VET_OUT=$(go vet "$working_dir/..." 2>&1) || VET_EXIT=$?
+
+        if [ "${VET_EXIT:-0}" -ne 0 ]; then
+          echo "$VET_OUT"
+
+          if [ "${{ inputs.annotate }}" = "true" ]; then
+            # Extract file:line:col pattern from go vet output
+            echo "$VET_OUT" | grep -Po '^\S+\.go:\d+:\d+:' | sort -u | while IFS=: read -r file line col rest; do
+              [ -z "$file" ] && continue
+              echo "::error file=$file,line=$line,col=$col,title=go vet::vet failure"
+            done
+          fi
+
+          if [ "${{ inputs.severity }}" = "error" ]; then
+            echo "::endgroup::"
+            exit 1
+          fi
+        else
+          echo "go vet passed."
+        fi
+        echo "::endgroup::"
+
+    - name: golangci-lint
+      id: lint
+      if: ${{ inputs.skip-lint != 'true' }}
+      shell: bash
+      run: |
+        echo "::group::golangci-lint"
+        working_dir="${{ inputs.working-directory }}"
+        REPORT="${{ runner.temp }}/golangci-lint-report.txt"
+        echo "report=$REPORT" >> "$GITHUB_OUTPUT"
+
+        LINT_ARGS="${{ inputs.lint-args }}"
+        if [ -z "$LINT_ARGS" ]; then
+          LINT_ARGS="--timeout=5m"
+        fi
+
+        golangci-lint run $LINT_ARGS "$working_dir/..." 2>&1 | tee "$REPORT" || LINT_EXIT=$?
+
+        if [ "${LINT_EXIT:-0}" -ne 0 ]; then
+          # Generate annotations from standard golangci-lint format:
+          # path/to/file.go:line:col: message (linter)
+          while IFS= read -r line; do
+            file=$(echo "$line" | grep -Po '^\S+\.go:\d+:\d+:' | cut -d: -f1)
+            lnum=$(echo "$line" | grep -Po '^\S+\.go:\K\d+' | head -1)
+            col=$(echo "$line" | grep -Po '^\S+\.go:\d+:\K\d+' | head -1)
+            msg=$(echo "$line" | grep -Po '^[^:]+:\d+:\d+:\s*\K.*' || echo "$line")
+            [ -z "$file" ] && continue
+            if [ "${{ inputs.annotate }}" = "true" ]; then
+              echo "::error file=$file,line=$lnum,col=$col,title=golangci-lint::$msg"
+            fi
+          done < "$REPORT"
+
+          if [ "${{ inputs.severity }}" = "error" ]; then
+            echo "::endgroup::"
+            exit 1
+          fi
+        else
+          echo "golangci-lint passed."
+        fi
+        echo "::endgroup::"
+
+    - name: go test
+      id: test
+      if: ${{ inputs.skip-test != 'true' }}
+      shell: bash
+      run: |
+        echo "::group::go test"
+        working_dir="${{ inputs.working-directory }}"
+        REPORT="${{ runner.temp }}/go-test-output.json"
+        echo "report=$REPORT" >> "$GITHUB_OUTPUT"
+
+        TEST_ARGS="${{ inputs.test-args }}"
+
+        go test $TEST_ARGS "$working_dir/..." -json 2>&1 | tee "$REPORT" || TEST_EXIT=$?
+
+        if [ "${TEST_EXIT:-0}" -ne 0 ]; then
+          # Extract failure lines from JSON output for annotations
+          while IFS= read -r entry; do
+            action=$(echo "$entry" | grep -Po '"Action":"\K[^"]+')
+            if [ "$action" = "fail" ]; then
+              pkg=$(echo "$entry" | grep -Po '"Package":"\K[^"]+')
+              test_name=$(echo "$entry" | grep -Po '"Test":"\K[^"]+')
+              output=$(echo "$entry" | grep -Po '"Output":"\K[^"]+')
+              if [ "${{ inputs.annotate }}" = "true" ]; then
+                echo "::error title=go test ($pkg)::$test_name failed: $output"
+              fi
+            fi
+          done < "$REPORT"
+
+          if [ "${{ inputs.severity }}" = "error" ]; then
+            echo "::endgroup::"
+            exit 1
+          fi
+        else
+          echo "All tests passed."
+        fi
+        echo "::endgroup::"
+
+    - name: Summary
+      if: always()
+      shell: bash
+      run: |
+        echo ""
+        echo "═══════════════════════════════════════"
+        echo "  Go Guardian — Quality Gate Complete"
+        echo "═══════════════════════════════════════"
+        echo ""
+
+        checks=("gofmt" "go vet" "golangci-lint" "go test")
+        skips=("${{ inputs.skip-fmt }}" "${{ inputs.skip-vet }}" "${{ inputs.skip-lint }}" "${{ inputs.skip-test }}")
+
+        for i in "${!checks[@]}"; do
+          check="${checks[$i]}"
+          if [ "${skips[$i]}" = "true" ]; then
+            echo "  ⏭  $check — skipped"
+          else
+            echo "  ✅ $check — completed"
+          fi
+        done
+
+        echo ""
+        echo "  Upgrade to Premium for advanced features:"
+        echo "  → https://kryptorious.gumroad.com/l/jbvet"
+        echo ""
