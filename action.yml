@@ -151,7 +151,7 @@ runs:
           LINT_ARGS="--timeout=5m"
         fi
 
-        golangci-lint run $LINT_ARGS "$working_dir/..." 2>&1 | tee "$REPORT" || LINT_EXIT=$?
+        golangci-lint run $LINT_ARGS "$working_dir/..." 2>&1 | tee "$REPORT"; LINT_EXIT=${PIPESTATUS[0]}
 
         if [ "${LINT_EXIT:-0}" -ne 0 ]; then
           # Generate annotations from standard golangci-lint format:
@@ -188,7 +188,7 @@ runs:
 
         TEST_ARGS="${{ inputs.test-args }}"
 
-        go test $TEST_ARGS "$working_dir/..." -json 2>&1 | tee "$REPORT" || TEST_EXIT=$?
+        go test $TEST_ARGS "$working_dir/..." -json 2>&1 | tee "$REPORT"; TEST_EXIT=${PIPESTATUS[0]}
 
         if [ "${TEST_EXIT:-0}" -ne 0 ]; then
           # Extract failure lines from JSON output for annotations
